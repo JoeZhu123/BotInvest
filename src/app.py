@@ -14,6 +14,7 @@ except ImportError:
     FutuTrader = None
 
 import os
+from market_data_providers import probe_futu_quote
 
 # --- 页面基础配置 ---
 st.set_page_config(
@@ -22,6 +23,38 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- 缓存：避免 Streamlit 重跑导致频繁请求触发限流 ---
+@st.cache_data(ttl=600, show_spinner=False)  # 10分钟缓存
+def cached_history(
+    ticker: str,
+    period: str,
+    offline_mode: bool,
+    data_source: str,
+    futu_host: str,
+    futu_port: int,
+    futu_enabled: bool,
+) -> pd.DataFrame | None:
+    loader = DataLoader()
+    return loader.get_stock_history(
+        ticker,
+        period=period,
+        allow_fallback=offline_mode,
+        data_source=data_source,
+        futu_host=futu_host,
+        futu_port=futu_port,
+        futu_enabled=futu_enabled,
+    )
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_news(ticker: str) -> list[dict]:
+    loader = DataLoader()
+    return loader.get_stock_news(ticker)
+
+# OpenD 探测做短缓存，避免每次 Streamlit 重跑都尝试连接刷屏
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_probe_futu(host: str, port: int) -> tuple[bool, str]:
+    return probe_futu_quote(host, port)
 
 # --- 简洁 CSS 样式 (仅做微调) ---
 def local_css():
@@ -72,6 +105,25 @@ if "trader" not in st.session_state:
     st.session_state.trader = PaperTrader()
 if "trading_mode" not in st.session_state:
     st.session_state.trading_mode = "Paper"
+if "last_df" not in st.session_state:
+    st.session_state.last_df = None
+if "last_ticker" not in st.session_state:
+    st.session_state.last_ticker = None
+if "last_period" not in st.session_state:
+    st.session_state.last_period = None
+if "last_data_source" not in st.session_state:
+    st.session_state.last_data_source = None
+if "last_futu_host" not in st.session_state:
+    st.session_state.last_futu_host = None
+if "last_futu_port" not in st.session_state:
+    st.session_state.last_futu_port = None
+if "market_data_source" not in st.session_state:
+    # 默认优先富途；如果探测失败会在运行时自动降级
+    st.session_state.market_data_source = "auto"
+if "futu_host" not in st.session_state:
+    st.session_state.futu_host = os.getenv("FUTU_OPEND_HOST", "127.0.0.1")
+if "futu_port" not in st.session_state:
+    st.session_state.futu_port = int(os.getenv("FUTU_OPEND_PORT", "11111"))
 
 def main():
     profile = UserProfile()
@@ -120,6 +172,38 @@ def main():
         st.markdown("### 标的选择")
         ticker = st.text_input("股票代码", value="AAPL", help="美股: AAPL; 港股: 0700.HK; A股: 600519.SS").upper()
         period = st.select_slider("时间周期", options=["1mo", "3mo", "6mo", "1y"], value="6mo")
+        offline_mode = st.checkbox("离线模式（使用本地模拟数据）", value=False, help="当网络限流/不可用时，用 data/sample_data.csv 演示")
+        st.markdown("### 行情源")
+        data_source = st.selectbox(
+            "行情源选择",
+            ["auto", "futu", "yahoo", "stooq", "alphavantage"],
+            index=["auto", "futu", "yahoo", "stooq", "alphavantage"].index(st.session_state.market_data_source)
+            if st.session_state.market_data_source in ["auto", "futu", "yahoo", "stooq", "alphavantage"]
+            else 0,
+            help="auto=默认优先Futu Quote(需OpenD)+自动降级；stooq/alphavantage主要覆盖美股",
+        )
+        st.session_state.market_data_source = data_source
+
+        # 富途 Quote 连接状态（用于行情源为 futu/auto）
+        with st.expander("富途 Quote 连接状态", expanded=(data_source in ["auto", "futu"])):
+            futu_host = st.text_input("OpenD Host(行情)", value=st.session_state.futu_host)
+            futu_port = st.number_input("OpenD Port(行情)", value=st.session_state.futu_port)
+            st.session_state.futu_host = futu_host
+            st.session_state.futu_port = int(futu_port)
+
+            ok, msg = cached_probe_futu(futu_host, int(futu_port))
+            if ok:
+                st.success(f"✅ {msg}")
+            else:
+                st.warning(f"⚠️ {msg}")
+                if data_source == "futu":
+                    st.info("已自动将行情源降级为 auto（会继续尝试其它备用源）。")
+                    st.session_state.market_data_source = "auto"
+                    data_source = "auto"
+                if data_source == "auto":
+                    st.caption("OpenD 不可用时，auto 会跳过富途行情，转而使用其它备用源。")
+
+        refresh_now = st.button("刷新行情数据", use_container_width=True)
         
         st.divider()
         if st.button("清空对话"):
@@ -140,13 +224,46 @@ def main():
     # === Tab 1: 市场分析 ===
     with tab_analysis:
         # 1. 获取数据
-        loader = DataLoader()
         with st.spinner('加载数据...'):
-            df = loader.get_stock_history(ticker, period=period)
+            need_refresh = (
+                refresh_now
+                or (st.session_state.last_df is None)
+                or (st.session_state.last_ticker != ticker)
+                or (st.session_state.last_period != period)
+                or (st.session_state.last_data_source != data_source)
+                or (st.session_state.last_futu_host != st.session_state.futu_host)
+                or (st.session_state.last_futu_port != st.session_state.futu_port)
+            )
+            if need_refresh:
+                df = cached_history(
+                    ticker,
+                    period,
+                    offline_mode,
+                    data_source,
+                    st.session_state.futu_host,
+                    st.session_state.futu_port,
+                    ok if data_source == "auto" else True,
+                )
+                st.session_state.last_df = df
+                st.session_state.last_ticker = ticker
+                st.session_state.last_period = period
+                st.session_state.last_data_source = data_source
+                st.session_state.last_futu_host = st.session_state.futu_host
+                st.session_state.last_futu_port = st.session_state.futu_port
+            else:
+                df = st.session_state.last_df
         
         if df is None or df.empty:
-            st.error(f"无法获取 {ticker} 数据")
+            st.error(f"无法获取 {ticker} 数据。请检查代码格式，或稍后再试（可能被数据源限流）。")
+            st.caption("支持格式示例：AAPL / TSLA / 0700.HK / 600519.SS / 300750.SZ / HK.00700 / SH.600519")
+            st.caption("如果出现 Rate limited：先等待 2-10 分钟；尽量减少频繁刷新；或临时勾选“离线模式”。")
             return
+
+        used_source = getattr(df, "attrs", {}).get("data_source", "unknown")
+        st.caption(f"行情源：{used_source}")
+
+        # 获取新闻
+        news_items = cached_news(ticker)
 
         # 2. 技术分析 (分步调用以防报错)
         analyzer = TechnicalAnalyzer(df)
@@ -197,16 +314,39 @@ def main():
         )
         st.plotly_chart(fig, use_container_width=True)
 
+        # 5. 新闻情报
+        st.subheader("📰 市场情报")
+        if news_items:
+            with st.expander(f"查看 {ticker} 最新资讯 ({len(news_items)}条)", expanded=True):
+                for item in news_items[:3]: # 只显示前3条
+                    st.markdown(f"**[{item.get('title')}]({item.get('link')})**")
+                    st.caption(f"来源: {item.get('publisher')} | 时间: {pd.to_datetime(item.get('providerPublishTime'), unit='s')}")
+        else:
+            st.info("暂无相关新闻")
+
         st.divider()
 
-        # 5. AI 顾问
+        # 6. AI 顾问
         st.subheader("AI 分析建议")
         
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
         
-        context_str = f"Ticker: {ticker}, Price: {latest['Close']:.2f}, RSI: {latest['RSI']:.2f}, MA5: {latest['SMA_5']:.2f}, Support: {latest['Support_Level']:.2f}"
+        # 构建包含新闻的上下文
+        news_summary = "\n".join([f"- {n['title']}" for n in news_items[:5]]) if news_items else "无最新新闻"
+        
+        context_str = f"""
+        Ticker: {ticker}
+        Price: {latest['Close']:.2f}
+        RSI: {latest['RSI']:.2f}
+        MA5: {latest['SMA_5']:.2f}
+        Support: {latest['Support_Level']:.2f}
+        
+        Recent News Headlines:
+        {news_summary}
+        """
+        
         user_principles = profile.get_principles_text()
         advisor = LLMAdvisor(api_key=api_key, base_url=base_url, model=model_name)
 
@@ -228,6 +368,7 @@ def main():
     # === Tab 2: 交易终端 (简洁版) ===
     with tab_trading:
         current_mode = st.session_state.trading_mode
+        loader = DataLoader()
         
         try:
             acc = trader.get_account()
@@ -243,7 +384,7 @@ def main():
                     current_prices[t] = latest['Close']
                 else:
                     try:
-                        d = loader.get_stock_history(t, "1d")
+                        d = loader.get_stock_history(t, "1d", allow_fallback=False, data_source=data_source)
                         if d is not None: current_prices[t] = d.iloc[-1]['Close']
                     except: pass
         

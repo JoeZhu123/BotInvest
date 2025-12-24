@@ -5,9 +5,6 @@ class LLMAdvisor:
     def __init__(self, api_key: str = None, base_url: str = None, model: str = "gpt-3.5-turbo"):
         """
         初始化 AI 投资顾问
-        :param api_key: API 密钥 (如果不传，尝试从环境变量读取)
-        :param base_url: API 基础地址 (用于 DeepSeek 或自定义代理)
-        :param model: 模型名称 (e.g., "gpt-4", "deepseek-chat", "gemini-pro")
         """
         self.api_key = api_key or os.getenv("LLM_API_KEY")
         self.base_url = base_url or os.getenv("LLM_BASE_URL")
@@ -44,10 +41,7 @@ class LLMAdvisor:
 
     def get_chat_response(self, messages: list, context_data: str = "", user_profile: str = "") -> str:
         """
-        流式对话接口，支持 Streamlit
-        :param messages: 历史消息列表 [{"role": "user", "content": "..."}]
-        :param context_data: 当前股票数据的上下文信息 (作为 System Prompt 的补充)
-        :param user_profile: 用户投资思想/档案的文本
+        流式对话接口
         """
         if not self.client:
             yield "请先配置 API Key 才能使用 AI 助手。"
@@ -61,9 +55,11 @@ class LLMAdvisor:
 用户的核心投资思想与原则：
 {user_profile}
 
-请基于上述数据回答用户的问题。如果用户问及具体点位，请参考上下文中的支撑/阻力位。
-【重要】：请务必结合用户的“核心投资思想”给出建议。如果市场机会违反了用户的原则（如追高、左侧抄底等），请提出警告。
-回答要简洁、客观。不要臆测没有数据的未来。
+任务：
+1. 请结合【最新行情数据】和【最新新闻资讯】（如果有）进行综合分析。
+2. 回答要简洁、客观。如果新闻对股价有重大影响（利好/利空），请务必指出。
+3. 如果用户问及具体点位，请参考上下文中的支撑/阻力位。
+4. 必须遵守用户的投资原则。
 """
         
         full_messages = [{"role": "system", "content": system_prompt}] + messages

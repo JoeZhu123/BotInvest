@@ -12,6 +12,7 @@ BotInvest 是一个基于 Python 和 LLM (大语言模型) 的智能投资辅助
 - **自然语言对话**: 像聊天一样询问 "AAPL 现在能买吗？"，AI 会基于实时数据回答。
 - **专业交易计划**: 每次分析都会生成结构化的交易计划，包含 **买入点 (Entry)**、**止损点 (Stop Loss)** 和 **止盈点 (Take Profit)**。
 - **数据驱动**: 结合 RSI、均线 (SMA)、ATR (波动率) 和 支撑/阻力位 进行客观分析。
+- **市场情报**: 自动拉取最新新闻标题，AI 会结合新闻与技术指标做综合判断。
 
 ### 2. 📅 智能选股推荐 (Smart Screener)
 - **自动扫描**: 一键扫描美股 (如 AAPL, TSLA) 和 港股 (如 腾讯, 阿里) 的热门标的。
@@ -25,7 +26,12 @@ BotInvest 是一个基于 Python 和 LLM (大语言模型) 的智能投资辅助
 - **数据持久化**: 交易记录和持仓自动保存在 `portfolio.json`，重启不丢失。
 - **可扩展架构**: 代码采用适配器模式，支持未来接入富途 (Futu) 或 盈透 (IB) 实盘 API。
 
-### 4. 📝 投资思想库 (Philosophy & Discipline)
+### 4. 📡 多行情源 (Market Data Sources)
+- **默认优先富途行情**: `auto` 模式优先使用 **Futu Quote API**（需本机 OpenD 可用），显著降低 Yahoo 的限流问题。
+- **自动降级**: 当富途不可用时，会自动降级到 Yahoo / Stooq / AlphaVantage（按可用性依次尝试）。
+- **手动切换**: 网页侧边栏可直接选择行情源，并显示“当前实际使用的行情源”。 
+
+### 5. 📝 投资思想库 (Philosophy & Discipline)
 - **个性化记忆**: 记录你的核心投资原则（如 "不追高"、"亏损不过 2%"）。
 - **纪律执行**: AI 在给出建议时，会**强制检查**是否违背了你的原则，并发出警告。
 
@@ -69,6 +75,45 @@ python -m streamlit run src/app.py
 
 ---
 
+## 🧩 富途 OpenD / Quote 配置（行情）
+
+如果你希望使用 **富途行情（Quote API）**，需要：
+
+1. 安装依赖：
+
+```bash
+pip install futu-api
+```
+
+2. 启动并登录 **FutuOpenD**（或富途客户端 OpenAPI 插件），确保本机监听端口（默认 `11111`）。
+
+3. 在网页侧边栏：
+- **行情源** 选择 `auto`（推荐）或 `futu`
+- 在 **“富途 Quote 连接状态”** 看到 ✅ 说明连接成功
+
+可用命令验证端口（Windows PowerShell）：
+
+```powershell
+Test-NetConnection -ComputerName 127.0.0.1 -Port 11111
+```
+
+---
+
+## 🧊 缓存与限流说明
+
+由于 Streamlit 会在交互时重跑脚本，外部数据源容易触发限流。项目已做了优化：
+
+- **行情/新闻默认缓存**：减少频繁请求
+- **手动刷新按钮**：需要更新时再点“刷新行情数据”
+- **离线模式**：勾选后会用本地 `data/sample_data.csv` 演示流程
+
+如遇到 `Too Many Requests / Rate limited`：
+- 先等待 2–10 分钟冷却
+- 尽量减少频繁刷新
+- 优先使用 `auto/futu` 行情源（富途可用时）
+
+---
+
 ## 💡 完整投资闭环
 
 BotInvest 旨在打造一个完整的投资工作流：
@@ -98,6 +143,7 @@ BotInvest/
 ├── data/               # 本地数据存储 (缓存/模拟数据)
 ├── src/                # 源代码目录
 │   ├── app.py          # Web 应用入口 (Streamlit)
+│   ├── market_data_providers.py # 多行情源适配（Futu/Yahoo/Stooq/AlphaVantage）
 │   ├── trading_system.py # 交易系统 (PaperTrader)
 │   ├── screener.py     # 选股器逻辑
 │   ├── llm_advisor.py  # AI 顾问核心
