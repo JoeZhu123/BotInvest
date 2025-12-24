@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.ipynb_checkpoints/
+# 本地数据文件，通常不需要上传到代码库
+data/
+portfolio.json
+user_profile.json
+
