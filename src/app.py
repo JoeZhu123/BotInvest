@@ -14,7 +14,8 @@ except ImportError:
     FutuTrader = None
 
 import os
-from market_data_providers import probe_futu_quote
+import time
+from market_data_providers import probe_futu_quote, FutuQuoteClient
 
 # --- 页面基础配置 ---
 st.set_page_config(
@@ -35,6 +36,18 @@ def cached_history(
     futu_port: int,
     futu_enabled: bool,
 ) -> pd.DataFrame | None:
+    # 如果选择/允许富途行情，优先走复用连接（cache_resource）
+    if data_source in ("futu", "auto") and futu_enabled:
+        try:
+            client = get_futu_quote_client(futu_host, int(futu_port))
+            if client is not None:
+                df = client.get_history(ticker, period=period, interval="1d")
+                if df is not None and not df.empty:
+                    return df
+        except Exception:
+            # 失败则交给 DataLoader 的降级逻辑
+            pass
+
     loader = DataLoader()
     return loader.get_stock_history(
         ticker,
@@ -56,6 +69,13 @@ def cached_news(ticker: str) -> list[dict]:
 def cached_probe_futu(host: str, port: int) -> tuple[bool, str]:
     return probe_futu_quote(host, port)
 
+# 复用 Quote 连接：同 host/port 只创建一次
+@st.cache_resource(show_spinner=False)
+def get_futu_quote_client(host: str, port: int) -> FutuQuoteClient | None:
+    ok, _ = probe_futu_quote(host, int(port))
+    if not ok:
+        return None
+    return FutuQuoteClient(host=host, port=int(port))
 # --- 简洁 CSS 样式 (仅做微调) ---
 def local_css():
     st.markdown("""
@@ -117,6 +137,10 @@ if "last_futu_host" not in st.session_state:
     st.session_state.last_futu_host = None
 if "last_futu_port" not in st.session_state:
     st.session_state.last_futu_port = None
+if "futu_cooldown_until" not in st.session_state:
+    st.session_state.futu_cooldown_until = 0.0
+if "last_toast" not in st.session_state:
+    st.session_state.last_toast = ""
 if "market_data_source" not in st.session_state:
     # 默认优先富途；如果探测失败会在运行时自动降级
     st.session_state.market_data_source = "auto"
@@ -169,8 +193,33 @@ def main():
 
         st.divider()
         
+        st.markdown("### 🔎 搜索标的（yfinance）")
+        loader_for_search = DataLoader()
+        search_query = st.text_input("输入公司名/代码关键词", value="", placeholder="例如：Apple / 腾讯 / TSLA / 0700")
+        if "ticker_input" not in st.session_state:
+            st.session_state.ticker_input = "AAPL"
+        if search_query:
+            results = loader_for_search.search_symbols(search_query, max_results=12)
+            if results:
+                options = [
+                    f"{r.get('symbol')} | {r.get('shortname') or ''} | {r.get('exchange') or ''}"
+                    for r in results
+                    if r.get("symbol")
+                ]
+                chosen = st.selectbox("搜索结果", options)
+                if st.button("应用到代码输入框"):
+                    st.session_state.ticker_input = chosen.split("|")[0].strip().upper()
+                    st.rerun()
+            else:
+                st.caption("未找到结果，尝试换关键词（或网络受限）。")
+
         st.markdown("### 标的选择")
-        ticker = st.text_input("股票代码", value="AAPL", help="美股: AAPL; 港股: 0700.HK; A股: 600519.SS").upper()
+        ticker = st.text_input(
+            "股票代码",
+            value=st.session_state.ticker_input,
+            key="ticker_input",
+            help="美股: AAPL; 港股: 0700.HK; A股: 600519.SS",
+        ).upper()
         period = st.select_slider("时间周期", options=["1mo", "3mo", "6mo", "1y"], value="6mo")
         offline_mode = st.checkbox("离线模式（使用本地模拟数据）", value=False, help="当网络限流/不可用时，用 data/sample_data.csv 演示")
         st.markdown("### 行情源")
@@ -202,6 +251,12 @@ def main():
                     data_source = "auto"
                 if data_source == "auto":
                     st.caption("OpenD 不可用时，auto 会跳过富途行情，转而使用其它备用源。")
+
+            # 冷却提示
+            now = time.time()
+            if st.session_state.futu_cooldown_until > now:
+                left = int(st.session_state.futu_cooldown_until - now)
+                st.caption(f"富途行情冷却中：{left}s（避免断线时反复重连刷屏）")
 
         refresh_now = st.button("刷新行情数据", use_container_width=True)
         
@@ -235,6 +290,9 @@ def main():
                 or (st.session_state.last_futu_port != st.session_state.futu_port)
             )
             if need_refresh:
+                # auto 模式下：如果 OpenD 不可用或处于冷却期，则跳过富途
+                now = time.time()
+                futu_ok_for_auto = ok and (st.session_state.futu_cooldown_until <= now)
                 df = cached_history(
                     ticker,
                     period,
@@ -242,7 +300,7 @@ def main():
                     data_source,
                     st.session_state.futu_host,
                     st.session_state.futu_port,
-                    ok if data_source == "auto" else True,
+                    futu_ok_for_auto if data_source == "auto" else True,
                 )
                 st.session_state.last_df = df
                 st.session_state.last_ticker = ticker
@@ -261,6 +319,30 @@ def main():
 
         used_source = getattr(df, "attrs", {}).get("data_source", "unknown")
         st.caption(f"行情源：{used_source}")
+
+        # 若实际用了富途但后续断线（或本次获取失败走了降级），设置冷却，避免刷屏
+        if data_source == "auto" and used_source != "futu":
+            # 当用户期望 auto 走富途但实际没走时，冷却 60 秒（减少频繁尝试）
+            st.session_state.futu_cooldown_until = max(st.session_state.futu_cooldown_until, time.time() + 60)
+
+            toast_msg = f"富途行情不可用，已自动切换到：{used_source}"
+            if toast_msg != st.session_state.last_toast:
+                st.toast(toast_msg)
+                st.session_state.last_toast = toast_msg
+
+        # 行情源诊断（降级链路可视化）
+        trace = getattr(df, "attrs", {}).get("trace", [])
+        with st.expander("行情源诊断（降级链路）", expanded=False):
+            st.write(f"选择的行情源：{data_source}")
+            st.write(f"实际使用的行情源：{used_source}")
+            now = time.time()
+            if st.session_state.futu_cooldown_until > now:
+                left = int(st.session_state.futu_cooldown_until - now)
+                st.write(f"富途冷却剩余：{left}s")
+            if trace:
+                st.dataframe(pd.DataFrame(trace), use_container_width=True, hide_index=True)
+            else:
+                st.caption("暂无链路信息（可能直接命中缓存/或数据源未提供 trace）。")
 
         # 获取新闻
         news_items = cached_news(ticker)
@@ -438,6 +520,31 @@ def main():
             else:
                 st.caption("暂无持仓")
 
+            # 订单管理（参考 futu_algo：把订单列表/撤单能力放到面板里）
+            with st.expander("订单管理（实盘）", expanded=False):
+                if hasattr(trader, "list_orders"):
+                    try:
+                        orders = trader.list_orders()
+                        if orders is None or orders.empty:
+                            st.caption("暂无订单")
+                        else:
+                            st.dataframe(orders.sort_values(by=orders.columns[0], ascending=False), use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"订单查询失败: {e}")
+
+                    cancel_id = st.text_input("撤单 Order ID", value="", placeholder="输入 order_id（仅实盘）")
+                    if st.button("撤单", use_container_width=True):
+                        if hasattr(trader, "cancel_order"):
+                            ok_cancel, msg_cancel = trader.cancel_order(cancel_id)
+                            if ok_cancel:
+                                st.success(msg_cancel)
+                            else:
+                                st.error(msg_cancel)
+                        else:
+                            st.info("当前交易通道不支持撤单")
+                else:
+                    st.caption("当前交易通道不支持订单管理（模拟盘可忽略）")
+
     # === Tab 3: 选股扫描 ===
     with tab_screener:
         c1, c2 = st.columns([4, 1])
@@ -450,7 +557,12 @@ def main():
                 def prog(c, t, tic):
                     bar.progress(int(c/t*100))
                     txt.caption(f"正在分析: {tic}")
-                st.session_state.screener_results = screener.run_screener(prog)
+                st.session_state.screener_results = screener.run_screener(
+                    prog,
+                    data_source=data_source,
+                    futu_host=st.session_state.futu_host,
+                    futu_port=st.session_state.futu_port,
+                )
                 bar.empty()
                 txt.empty()
 

@@ -8,7 +8,7 @@ class Screener:
         self.loader = DataLoader()
         self.pool = StockPool()
 
-    def run_screener(self, progress_callback=None):
+    def run_screener(self, progress_callback=None, data_source: str = "auto", futu_host: str | None = None, futu_port: int | None = None):
         """
         运行选股器
         :param progress_callback: 回调函数，用于更新 UI 进度条 (current, total, current_ticker)
@@ -21,13 +21,27 @@ class Screener:
         }
         
         total = len(tickers)
+
+        # 参考 yfinance：尽量批量拉取美股（降低限流/提升速度）
+        batch_map: dict[str, pd.DataFrame] = {}
+        try:
+            if data_source in ("auto", "yahoo"):
+                us_tickers = [t for t in tickers if "." not in t]  # 简单认为不带后缀的是美股
+                if us_tickers:
+                    batch_map = self.loader.get_batch_history_yahoo(us_tickers, period="6mo", interval="1d")
+        except Exception:
+            batch_map = {}
         
         for i, ticker in enumerate(tickers):
             if progress_callback:
                 progress_callback(i, total, ticker)
-                
-            # 获取数据 (使用较短周期以加快速度，但为了MA60需要至少3个月)
-            df = self.loader.get_stock_history(ticker, period="6mo")
+
+            df = None
+            if ticker in batch_map:
+                df = batch_map[ticker]
+            else:
+                # 获取数据 (使用较短周期以加快速度，但为了MA60需要至少3个月)
+                df = self.loader.get_stock_history(ticker, period="6mo", data_source=data_source, futu_host=futu_host, futu_port=futu_port)
             
             if df is None or df.empty or len(df) < 60:
                 continue

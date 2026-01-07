@@ -114,6 +114,16 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 11111
 
 ---
 
+## 📚 参考项目（Inspiration）
+
+本项目在设计与功能取舍上参考了以下开源项目的思路：
+
+- **yfinance**：提供 Yahoo Finance 的数据访问能力（包含 `Search` / 批量下载等组件）。参考：[ranaroussi/yfinance](https://github.com/ranaroussi/yfinance)
+- **futu_algo**：提供富途 OpenAPI 的量化交易工程化实践（订单/交易风控等思路）。参考：[billpwchan/futu_algo](https://github.com/billpwchan/futu_algo)
+- **Qbot**：全链路量化系统的工程拆分思路（数据→研究→回测→实盘的流水线）。参考：[UFund-Me/Qbot](https://github.com/UFund-Me/Qbot)
+
+---
+
 ## 💡 完整投资闭环
 
 BotInvest 旨在打造一个完整的投资工作流：

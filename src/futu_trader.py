@@ -1,15 +1,20 @@
 try:
-    from futu import *
+    # futu-api 9.x 中证券交易使用 OpenSecTradeContext（不是 OpenTradeContext）
+    from futu import OpenSecTradeContext, TrdMarket, TrdSide, TrdEnv, RET_OK, ModifyOrderOp
 except ImportError:
     print("警告: 未安装 futu-api，实盘交易功能不可用。请运行 pip install futu-api")
     # 定义占位符以防报错
-    class OpenTradeContext: pass
-    RET_OK = 0
+    OpenSecTradeContext = None
+    TrdMarket = None
     TrdSide = None
     TrdEnv = None
+    RET_OK = 0
+    ModifyOrderOp = None
 
 from trading_system import BaseTrader, TradingAccount
 import time
+from market_data_providers import to_futu_code
+import pandas as pd
 
 class FutuTrader(BaseTrader):
     """
@@ -31,12 +36,13 @@ class FutuTrader(BaseTrader):
 
     def _connect(self):
         try:
-            # 建立美股连接
-            self.ctx_us = OpenTradeContext(host=self.host, port=self.port, filter_trdmarket=TrdMarket.US)
-            # 建立港股连接
-            self.ctx_hk = OpenTradeContext(host=self.host, port=self.port, filter_trdmarket=TrdMarket.HK)
-            # 建立A股连接 (沪深)
-            self.ctx_cn = OpenTradeContext(host=self.host, port=self.port, filter_trdmarket=TrdMarket.CN)
+            if OpenSecTradeContext is None:
+                raise RuntimeError("futu-api 未安装或导入失败")
+
+            # 建立证券交易连接（不同市场用 filter_trdmarket 区分）
+            self.ctx_us = OpenSecTradeContext(host=self.host, port=self.port, filter_trdmarket=TrdMarket.US)
+            self.ctx_hk = OpenSecTradeContext(host=self.host, port=self.port, filter_trdmarket=TrdMarket.HK)
+            self.ctx_cn = OpenSecTradeContext(host=self.host, port=self.port, filter_trdmarket=TrdMarket.CN)
             
             # 解锁交易 (如果提供了密码)
             if self.pwd_unlock:
@@ -50,18 +56,15 @@ class FutuTrader(BaseTrader):
 
     def _get_ctx(self, ticker):
         """根据股票代码返回对应的上下文"""
-        if '.' not in ticker: # 默认美股，如 AAPL
-            return self.ctx_us, "US." + ticker
-        
-        suffix = ticker.split('.')[-1]
-        if suffix in ['HK']:
-            return self.ctx_hk, "HK." + ticker.replace('.HK', '')
-        elif suffix in ['SS', 'SH']:
-            return self.ctx_cn, "SH." + ticker.replace('.SS', '').replace('.SH', '')
-        elif suffix in ['SZ']:
-            return self.ctx_cn, "SZ." + ticker.replace('.SZ', '')
-        else:
-            return self.ctx_us, "US." + ticker
+        t = (ticker or "").strip().upper()
+        futu_code = to_futu_code(t)
+
+        if futu_code.startswith("HK."):
+            return self.ctx_hk, futu_code
+        if futu_code.startswith(("SH.", "SZ.")):
+            return self.ctx_cn, futu_code
+        # 默认美股
+        return self.ctx_us, futu_code
 
     def get_account(self) -> TradingAccount:
         acc = TradingAccount(0.0)
@@ -103,6 +106,54 @@ class FutuTrader(BaseTrader):
                         }
         return acc
 
+    def list_orders(self):
+        """
+        查询当前订单（实盘）。返回 pandas.DataFrame（可能为空）
+        """
+        frames = []
+        for ctx in [self.ctx_us, self.ctx_hk, self.ctx_cn]:
+            if ctx is None:
+                continue
+            ret, data = ctx.order_list_query(trd_env=TrdEnv.REAL)
+            if ret == RET_OK and data is not None and not data.empty:
+                frames.append(data)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        return df
+
+    def cancel_order(self, order_id: str | int):
+        """
+        撤单（实盘）。先定位 order_id 属于哪个 market 的 ctx，再执行撤单。
+        """
+        if ModifyOrderOp is None:
+            return False, "futu-api 未正确导入"
+
+        oid = str(order_id).strip()
+        if not oid:
+            return False, "order_id 为空"
+
+        # 在各市场中查找订单
+        for ctx in [self.ctx_us, self.ctx_hk, self.ctx_cn]:
+            if ctx is None:
+                continue
+            ret, data = ctx.order_list_query(trd_env=TrdEnv.REAL)
+            if ret != RET_OK or data is None or data.empty:
+                continue
+            if "order_id" in data.columns and (data["order_id"].astype(str) == oid).any():
+                ret2, data2 = ctx.modify_order(
+                    ModifyOrderOp.CANCEL,
+                    order_id=oid,
+                    qty=0,
+                    price=0,
+                    trd_env=TrdEnv.REAL,
+                )
+                if ret2 == RET_OK:
+                    return True, "撤单成功"
+                return False, f"撤单失败: {data2}"
+
+        return False, "未找到该订单（可能已成交/已撤/不在当前市场连接）"
+
     def buy(self, ticker: str, qty: int, price: float):
         ctx, futu_code = self._get_ctx(ticker)
         if ctx is None: return False, "连接未建立"
@@ -115,7 +166,11 @@ class FutuTrader(BaseTrader):
             trd_env=TrdEnv.REAL
         )
         if ret == RET_OK:
-            return True, f"下单成功: {data['order_id'][0]}" # 修正取值
+            try:
+                order_id = data["order_id"].iloc[0]
+            except Exception:
+                order_id = ""
+            return True, f"下单成功: {order_id}"
         else:
             return False, f"下单失败: {data}"
 
@@ -131,7 +186,11 @@ class FutuTrader(BaseTrader):
             trd_env=TrdEnv.REAL
         )
         if ret == RET_OK:
-            return True, f"下单成功: {data['order_id'][0]}"
+            try:
+                order_id = data["order_id"].iloc[0]
+            except Exception:
+                order_id = ""
+            return True, f"下单成功: {order_id}"
         else:
             return False, f"下单失败: {data}"
 
