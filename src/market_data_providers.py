@@ -173,6 +173,52 @@ def probe_futu_quote(host: str, port: int) -> tuple[bool, str]:
         return False, f"无法连接 OpenD: {e}"
 
 
+class FutuQuoteClient:
+    """
+    长连接 Quote 客户端：复用 OpenQuoteContext，避免 Streamlit 重跑导致频繁重连刷屏。
+    """
+
+    def __init__(self, host: str, port: int):
+        from futu import OpenQuoteContext, RET_OK, KLType, AuType
+
+        self.OpenQuoteContext = OpenQuoteContext
+        self.RET_OK = RET_OK
+        self.KLType = KLType
+        self.AuType = AuType
+
+        self.host = host
+        self.port = int(port)
+        self.quote_ctx = self.OpenQuoteContext(host=self.host, port=self.port)
+
+    def get_history(self, yahoo_ticker: str, period: str, interval: str = "1d") -> Optional[pd.DataFrame]:
+        # 目前只做日线，降低复杂度与断线概率
+        if (interval or "1d").lower() not in ("1d", "1day", "day"):
+            interval = "1d"
+
+        end = pd.Timestamp.utcnow().tz_localize(None)
+        start = end - pd.Timedelta(days=_period_to_days(period))
+
+        code = to_futu_code(yahoo_ticker)
+        ret, data = self.quote_ctx.request_history_kline(
+            code=code,
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            ktype=self.KLType.K_DAY,
+            autype=self.AuType.QFQ,
+        )
+        if ret != self.RET_OK or data is None or data.empty:
+            return None
+        df = _normalize_ohlcv_df(data.copy())
+        df.attrs["data_source"] = "futu"
+        return df
+
+    def close(self):
+        try:
+            self.quote_ctx.close()
+        except Exception:
+            pass
+
+
 class StooqProvider(MarketDataProvider):
     """
     备用数据源（主要覆盖美股；港股/A股覆盖不稳定）
